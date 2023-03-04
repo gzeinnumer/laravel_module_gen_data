@@ -3,8 +3,13 @@
 namespace App\Http\Controllers;
 
 use App\Models\ModuleGenDataModel;
+use App\Models\User;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\File;
+use RecursiveDirectoryIterator;
+use RecursiveIteratorIterator;
+use ZipArchive;
 
 class ModuleGenDataController extends Controller
 {
@@ -47,13 +52,35 @@ class ModuleGenDataController extends Controller
             if ($temp == null) {
                 $temp = new ModuleGenDataModel();
                 $temp->spesial_conditions = "";
+                $temp->table_name = $data[$i]->table_name;
+                $temp->query = $data[$i]->query;
+                $temp->save();
             }
-
-            $temp->table_name = $data[$i]->table_name;
-            $temp->query = $data[$i]->query;
-            $temp->save();
         }
         return redirect('/modulegendata')->with('sukses', 'Success Generated Table');
+    }
+
+    public function regenerateAll()
+    {
+        $databaseName = DB::connection()->getDatabaseName();
+
+        $exclude = "'failed_jobs', 'migrations', 'password_resets', 'personal_access_tokens', 'module_gen_data'";
+        $data = DB::select("SELECT table_name FROM information_schema.tables WHERE table_schema = '$databaseName' and table_name not in($exclude);");
+
+        for ($i = 0; $i < count($data); $i++) {
+            $data[$i]->query = $this->generateQuery($data[$i]->table_name);
+        }
+
+        for ($i = 0; $i < count($data); $i++) {
+            $temp = ModuleGenDataModel::where(['table_name' => $data[$i]->table_name])->first();
+
+            if ($temp != null) {
+                $temp->table_name = $data[$i]->table_name;
+                $temp->query = $data[$i]->query;
+                $temp->save();
+            }
+        }
+        return redirect('/modulegendata')->with('sukses', 'Success Re-Generated Table');
     }
 
     public function generateQuery($table_name)
@@ -65,7 +92,7 @@ class ModuleGenDataController extends Controller
         $query = "CREATE TABLE $table_name (";
         for ($i = 0; $i < count($table); $i++) {
             $c = $table[$i];
-            if ($c->DATA_TYPE == "varchar" || $c->DATA_TYPE == "timestamp") {
+            if ($c->DATA_TYPE == "varchar" || $c->DATA_TYPE == "timestamp" || $c->DATA_TYPE == "text") {
                 $c->DATA_TYPE = " TEXT";
             } else if ($c->DATA_TYPE == "int" || $c->DATA_TYPE == "bigint") {
                 $c->DATA_TYPE = " INTEGER";
@@ -88,9 +115,9 @@ class ModuleGenDataController extends Controller
             } else {
                 $c->EXTRA = "";
             }
-            $query .= $c->COLUMN_NAME . $c->DATA_TYPE . $c->COLUMN_KEY . $c->IS_NULLABLE . $c->EXTRA . ", ";
+            $query .= "\n" . $c->COLUMN_NAME . $c->DATA_TYPE . $c->COLUMN_KEY . $c->IS_NULLABLE . $c->EXTRA . ", ";
         }
-        $query = rtrim($query, ', ') . ");";
+        $query = rtrim($query, ", ") . "\n);";
 
         return $query;
     }
@@ -103,7 +130,7 @@ class ModuleGenDataController extends Controller
 
     public function updateShow($id)
     {
-        return view('modulegendata.edit');
+        return view('modulegendata.edit', ['id' => $id]);
     }
 
     public function updatePerform(Request $r)
@@ -113,19 +140,104 @@ class ModuleGenDataController extends Controller
         return redirect('/modulegendata')->with('sukses', 'Success Update Data');
     }
 
+    public function regenerateqQuery($id)
+    {
+        $data = ModuleGenDataModel::find($id);
+        $data->query = $this->generateQuery($data->table_name);
+
+        return response([
+            'data' => $data->query,
+        ]);
+    }
+
     public function generateFile()
     {
+        $date = date('Ymd');
+        $path = public_path() . '/generate/' . $date;
+        if (!File::exists($path)) {
+            File::makeDirectory($path);
+        }
+
+        $users = User::all();
+
+        for ($i = 0; $i < count($users); $i++) {
+            $p = $path . "/" . $users[$i]->id;
+            if (!File::exists($p)) {
+                File::makeDirectory($p);
+            }
+
+            $output = $this->generateSql($users[$i]->id);
+
+            $myfile = fopen($p . "/db.db", "w") or die("Unable to open file!");
+            fwrite($myfile, $output);
+            fclose($myfile);
+
+            $rootPath = $p;
+
+            $zip = new ZipArchive();
+            $zip->open($p . '/db.zip', ZipArchive::CREATE | ZipArchive::OVERWRITE);
+
+            $files = new RecursiveIteratorIterator(
+                new RecursiveDirectoryIterator($rootPath),
+                RecursiveIteratorIterator::LEAVES_ONLY
+            );
+
+            foreach ($files as $name => $file) {
+                if (!$file->isDir()) {
+                    $filePath = $file->getRealPath();
+                    $relativePath = substr($filePath, strlen($rootPath) + 1);
+
+                    $zip->addFile($filePath, $relativePath);
+                }
+            }
+
+            $zip->close();
+            //delete file
+            unlink($p . "/db.db");
+        }
+        return response(["data" => "success"]);
     }
-    /*
-CREATE TABLE `examples` (
-  `id` int(11) NOT NULL,
-  `name` varchar(255) NOT NULL,
-  `flag_active` int(11) NOT NULL DEFAULT 1,
-  `created_at` timestamp NOT NULL DEFAULT current_timestamp(),
-  `updated_at` timestamp NULL DEFAULT NULL ON UPDATE current_timestamp()
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-    */
+
+    public function generateSql($id)
+    {
+        $res = "CREATE DATABASE db;\n\n";
+
+        $databaseName = DB::connection()->getDatabaseName();
+        $exclude = "'failed_jobs', 'migrations', 'password_resets', 'personal_access_tokens', 'module_gen_data'";
+        $data = DB::select("SELECT table_name FROM information_schema.tables WHERE table_schema = '$databaseName' and table_name not in($exclude);");
+
+        for ($i = 0; $i < count($data); $i++) {
+            $d = ModuleGenDataModel::where('table_name', $data[$i]->table_name)->first();
+            $res .= "" . $d->query . "\n\n";
+
+            $res .= "INSERT INTO $d->table_name VALUES \n";
+
+            $c = DB::select("SELECT * FROM $d->table_name $d->spesial_conditions");
+            for ($j = 0; $j < count($c); $j++) {
+                $res .= "(";
+                foreach ($c[$j] as $c1) {
+                    $res .= "'" . $c1 . "',";
+                }
+                $res = rtrim($res, ",");
+                $res .= "),\n";
+            }
+            $res = rtrim($res, ",\n");
+            $res .= ";\n\n\n";
+        }
+
+        return $res;
+    }
 }
+
+/*
+CREATE TABLE examples (
+    id int(11) NOT NULL,
+    name varchar(255) NOT NULL,
+    flag_active int(11) NOT NULL DEFAULT 1,
+    created_at timestamp NOT NULL DEFAULT current_timestamp(),
+    updated_at timestamp NULL DEFAULT NULL ON UPDATE current_timestamp()
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+*/
 
 /*
 CREATE TABLE contacts (
@@ -135,129 +247,4 @@ CREATE TABLE contacts (
 	email TEXT NOT NULL UNIQUE,
 	phone TEXT NOT NULL UNIQUE
 );
-*/
-
-/*
-[
-  {
-    "TABLE_CATALOG": "def",
-    "TABLE_SCHEMA": "laravel_module_gen_data",
-    "TABLE_NAME": "examples",
-    "COLUMN_NAME": "id",
-    "ORDINAL_POSITION": 1,
-    "COLUMN_DEFAULT": null,
-    "IS_NULLABLE": "NO",
-    "DATA_TYPE": "int",
-    "CHARACTER_MAXIMUM_LENGTH": null,
-    "CHARACTER_OCTET_LENGTH": null,
-    "NUMERIC_PRECISION": 10,
-    "NUMERIC_SCALE": 0,
-    "DATETIME_PRECISION": null,
-    "CHARACTER_SET_NAME": null,
-    "COLLATION_NAME": null,
-    "COLUMN_TYPE": "int(11)",
-    "COLUMN_KEY": "PRI",
-    "EXTRA": "auto_increment",
-    "PRIVILEGES": "select,insert,update,references",
-    "COLUMN_COMMENT": "",
-    "IS_GENERATED": "NEVER",
-    "GENERATION_EXPRESSION": null
-  },
-  {
-    "TABLE_CATALOG": "def",
-    "TABLE_SCHEMA": "laravel_module_gen_data",
-    "TABLE_NAME": "examples",
-    "COLUMN_NAME": "name",
-    "ORDINAL_POSITION": 2,
-    "COLUMN_DEFAULT": null,
-    "IS_NULLABLE": "NO",
-    "DATA_TYPE": "varchar",
-    "CHARACTER_MAXIMUM_LENGTH": 255,
-    "CHARACTER_OCTET_LENGTH": 1020,
-    "NUMERIC_PRECISION": null,
-    "NUMERIC_SCALE": null,
-    "DATETIME_PRECISION": null,
-    "CHARACTER_SET_NAME": "utf8mb4",
-    "COLLATION_NAME": "utf8mb4_general_ci",
-    "COLUMN_TYPE": "varchar(255)",
-    "COLUMN_KEY": "",
-    "EXTRA": "",
-    "PRIVILEGES": "select,insert,update,references",
-    "COLUMN_COMMENT": "",
-    "IS_GENERATED": "NEVER",
-    "GENERATION_EXPRESSION": null
-  },
-  {
-    "TABLE_CATALOG": "def",
-    "TABLE_SCHEMA": "laravel_module_gen_data",
-    "TABLE_NAME": "examples",
-    "COLUMN_NAME": "flag_active",
-    "ORDINAL_POSITION": 3,
-    "COLUMN_DEFAULT": "1",
-    "IS_NULLABLE": "NO",
-    "DATA_TYPE": "int",
-    "CHARACTER_MAXIMUM_LENGTH": null,
-    "CHARACTER_OCTET_LENGTH": null,
-    "NUMERIC_PRECISION": 10,
-    "NUMERIC_SCALE": 0,
-    "DATETIME_PRECISION": null,
-    "CHARACTER_SET_NAME": null,
-    "COLLATION_NAME": null,
-    "COLUMN_TYPE": "int(11)",
-    "COLUMN_KEY": "",
-    "EXTRA": "",
-    "PRIVILEGES": "select,insert,update,references",
-    "COLUMN_COMMENT": "",
-    "IS_GENERATED": "NEVER",
-    "GENERATION_EXPRESSION": null
-  },
-  {
-    "TABLE_CATALOG": "def",
-    "TABLE_SCHEMA": "laravel_module_gen_data",
-    "TABLE_NAME": "examples",
-    "COLUMN_NAME": "created_at",
-    "ORDINAL_POSITION": 4,
-    "COLUMN_DEFAULT": "current_timestamp()",
-    "IS_NULLABLE": "NO",
-    "DATA_TYPE": "timestamp",
-    "CHARACTER_MAXIMUM_LENGTH": null,
-    "CHARACTER_OCTET_LENGTH": null,
-    "NUMERIC_PRECISION": null,
-    "NUMERIC_SCALE": null,
-    "DATETIME_PRECISION": 0,
-    "CHARACTER_SET_NAME": null,
-    "COLLATION_NAME": null,
-    "COLUMN_TYPE": "timestamp",
-    "COLUMN_KEY": "",
-    "EXTRA": "",
-    "PRIVILEGES": "select,insert,update,references",
-    "COLUMN_COMMENT": "",
-    "IS_GENERATED": "NEVER",
-    "GENERATION_EXPRESSION": null
-  },
-  {
-    "TABLE_CATALOG": "def",
-    "TABLE_SCHEMA": "laravel_module_gen_data",
-    "TABLE_NAME": "examples",
-    "COLUMN_NAME": "updated_at",
-    "ORDINAL_POSITION": 5,
-    "COLUMN_DEFAULT": "NULL",
-    "IS_NULLABLE": "YES",
-    "DATA_TYPE": "timestamp",
-    "CHARACTER_MAXIMUM_LENGTH": null,
-    "CHARACTER_OCTET_LENGTH": null,
-    "NUMERIC_PRECISION": null,
-    "NUMERIC_SCALE": null,
-    "DATETIME_PRECISION": 0,
-    "CHARACTER_SET_NAME": null,
-    "COLLATION_NAME": null,
-    "COLUMN_TYPE": "timestamp",
-    "COLUMN_KEY": "",
-    "EXTRA": "on update current_timestamp()",
-    "PRIVILEGES": "select,insert,update,references",
-    "COLUMN_COMMENT": "",
-    "IS_GENERATED": "NEVER",
-    "GENERATION_EXPRESSION": null
-  }
-]
 */
